@@ -2,8 +2,6 @@
 Operations classes.
 """
 
-from typing import Any
-
 from .operation import Operation
 
 # Implemented by Pro Tools 2022.12
@@ -91,6 +89,7 @@ from .memory_locations import CId_EditMemoryLocation, \
 # Pro Tools 2023.9
 
 from .create_new_tracks import CId_CreateNewTracks
+from .delete_tracks import DeleteTracks
 from .select_tracks import CId_SelectTracksByName
 from .zoom_preset import CId_RecallZoomPreset
 from .timeline_selection import \
@@ -156,3 +155,10 @@ from .get_monitor_output_path import CId_GetMonitorOutputPath
 # Pro Tools 2025.10
 
 from .set_track_record_enable_state import CId_SetTrackRecordEnableState
+
+# Pro Tools color operations
+from .set_track_color import SetTrackColor
+from .get_color_palette import GetColorPalette
+from .spot_clips_by_id import SpotClipsByID
+from .get_clip_list import GetClipList
+from .import_audio_to_clip_list import ImportAudioToClipList
