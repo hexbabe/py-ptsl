@@ -885,6 +885,13 @@ class Engine:
                                      )
         self.client.run(op)
 
+
+    def delete_tracks(self, track_names: List[str]):
+        """Delete tracks by name."""
+        op = ops.DeleteTracks(track_names=track_names)
+        self.client.run(op)
+
+
     def select_tracks_by_name(self, names: List[str],
                               mode: Optional['SelectionMode'] = pt.SM_Replace):
         """
@@ -1328,7 +1335,6 @@ class Engine:
     # TODO add GetTimeAsType, SubtractLocations
     # TODO add AddLengthToLocation, SubtractPositions,
     # TODO add AddLengthToPosition
-    # TODO add ImportAudioToClipList, SpotClipsByID, GetClipList
     # TODO add GetMediaFileInfo, CreateAudioClips,
     # TODO add GetExportMixSourceList
     # TODO add BounceTrack
@@ -1360,10 +1366,90 @@ class Engine:
     # PT 2025.10
     # TODO add CreateSignalPath,
     # TODO add SetTrackMainOutputAssignments,
-    # TODO add SetTrackColor, GetTrackPlaylists, SetTrackTimebase,
-    # TODO add GetColorPalette
-
-    # TODO add DeleteTracks
+    # TODO add SetTrackTimebase, GetTrackPlaylists
     # TODO add WriteSelectedTranscriptionToJSONFile
     # TODO add CreateBatchJob, GetBatchJobStatus, CompleteBatchJob,
     # TODO add CancelBatchJob
+
+    def set_track_color(self, track_names: List[str], color_index: int) -> None:
+        """Set the color of one or more tracks by name."""
+        op = ops.SetTrackColor(track_names=track_names, color_index=color_index)
+        self.client.run(op)
+
+    def get_color_palette(self, target: Optional[int] = None) -> List[str]:
+        """Get the Pro Tools color palette for a target type."""
+        if target is None:
+            target = pt.CPTarget_Tracks
+        op = ops.GetColorPalette(color_palette_target=target)
+        self.client.run(op)
+        return list(op.response.color_list) if op.response else []
+
+    def import_audio_to_clip_list(
+        self,
+        file_list: List[str],
+        audio_operations: Optional[int] = None,
+        destination_path: Optional[str] = None,
+    ) -> 'pt.ImportAudioToClipListResponseBody':
+        """Import audio files to the clip list using the dedicated PTSL command.
+
+        Unlike import_audio() which uses the generic Import command, this uses
+        CId_ImportAudioToClipList (ID 123) which reliably updates the clip list.
+
+        Args:
+            file_list: Absolute paths of audio files to import.
+            audio_operations: AOperations_AddAudio (1), AOperations_CopyAudio (2),
+                or AOperations_ConvertAudio (3). Default: AOperations_AddAudio.
+            destination_path: Optional destination directory for copied/converted files.
+
+        Returns:
+            The response body with file_list (entries) and failure_list.
+        """
+        kwargs = {"file_list": file_list}
+        if audio_operations is not None:
+            kwargs["audio_operations"] = audio_operations
+        if destination_path is not None:
+            kwargs["destination_path"] = destination_path
+        op = ops.ImportAudioToClipList(**kwargs)
+        self.client.run(op)
+        return op.response
+
+    def get_clip_list(self) -> List['pt.Clip']:
+        """Get all clips in the current session's clip list."""
+        op = ops.GetClipList(
+            pagination_request=pt.PaginationRequest(limit=1000, offset=0)
+        )
+        self.client.run(op)
+        return list(op.response.clips) if op.response else []
+
+    def spot_clips_by_id(
+        self,
+        clip_ids: List[str],
+        track_name: str,
+        location_value: str = "0",
+        color_index: Optional[int] = None,
+    ) -> None:
+        """Spot clips to a named track at a given sample position.
+
+        :param location_value: Sample offset from the session start, as a string.
+            Defaults to "0" (session start).
+        :param color_index: Optional color index to assign to the clip instances.
+            Uses the same palette as track colors (range [1, 69]).
+        """
+        location_data = pt.SpotLocationData(
+            location_type=pt.Start,
+            location=pt.TimelineLocation(
+                time_type=pt.TLType_Samples,
+                location=location_value,
+            ),
+        )
+        kwargs = dict(
+            src_clips=clip_ids,
+            dst_track_name=track_name,
+            dst_location_data=location_data,
+        )
+        if color_index is not None:
+            kwargs["clip_instance_attributes"] = pt.ClipInstanceAttributes(
+                color_index=color_index
+            )
+        op = ops.SpotClipsByID(**kwargs)
+        self.client.run(op)
