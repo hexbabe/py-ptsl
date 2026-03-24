@@ -65,6 +65,19 @@ class Operation(Generic[Q, R]):
         """
         return in_json
 
+    def json_messup_for_version(self,
+                                in_json: str,
+                                server_version: int) -> str:
+        """
+        Version-aware request JSON cleanup hook.
+
+        Subclasses can override this when only older or newer PTSL servers
+        need request-shape adjustments. The default behaviour preserves the
+        existing json_messup() override contract.
+        """
+        del server_version
+        return self.json_messup(in_json)
+
     def json_cleanup(self, in_json: str) -> str:
         """
         A shim that can be overriden by subclases to adapt the json Pro

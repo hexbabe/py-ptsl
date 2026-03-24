@@ -1,9 +1,13 @@
+import os
+import time
+
 from ptsl.PTSL_pb2 import SAF_AIFF, SAF_WAVE, \
     SR_48000, Bit16, Bit24, Bit32Float, \
     IO_Last, IO_StereoMix, IO_51SMPTEMix
 
 import ptsl
 from ptsl import ops, util
+from ptsl.errors import CommandError
 
 
 class CreateSessionBuilder:
@@ -61,8 +65,32 @@ class CreateSessionBuilder:
     def interleaved(self, value: bool):
         self._is_interleaved = value
 
+    def _session_matches_target(self,
+                                timeout_s: float = 3.0,
+                                poll_s: float = 0.25) -> bool:
+        requested_root = os.path.realpath(self._path)
+        deadline = time.time() + timeout_s
+
+        while time.time() < deadline:
+            try:
+                current_name = self._engine.session_name()
+                current_path = self._engine.session_path()
+                # If this succeeds, the session is not merely "transitioning";
+                # PT considers it open enough for normal queries.
+                self._engine.session_sample_rate()
+            except Exception:
+                time.sleep(poll_s)
+                continue
+
+            current_real = os.path.realpath(current_path)
+            if current_name == self._session_name and current_real.startswith(requested_root):
+                return True
+
+            time.sleep(poll_s)
+
+        return False
+
     def create(self) -> None:
-        import pprint
         op = ops.CId_CreateSession(
             session_name=self._session_name,
             file_type=self._audio_format,
@@ -74,9 +102,14 @@ class CreateSessionBuilder:
             is_cloud_project=False,
             create_from_template=False,
         )
-        print("------")
-        pprint.pprint(op.request)
-        self._engine.client.run(op)
+        try:
+            self._engine.client.run(op)
+        except CommandError as exc:
+            # PT 2024.x occasionally returns PT_InvalidTask after the session
+            # is already open, and a naive retry then trips OS_DuplicateName.
+            if self._session_matches_target():
+                return
+            raise exc
 
 
 class CreateSessionFromTemplateBuilder(CreateSessionBuilder):

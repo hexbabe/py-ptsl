@@ -8,6 +8,7 @@ from typing import Optional, Tuple, List
 from contextlib import contextmanager
 
 import ptsl
+from ptsl import _compat_v5
 from ptsl import ops
 from ptsl.builders.create_session_builder import \
     CreateSessionBuilder, CreateSessionFromTemplateBuilder, \
@@ -1404,6 +1405,14 @@ class Engine:
         Returns:
             The response body with file_list (entries) and failure_list.
         """
+        if self.client.get_server_version() < 6:
+            return _compat_v5.import_audio_to_clip_list(
+                self,
+                file_list=file_list,
+                audio_operations=audio_operations,
+                destination_path=destination_path,
+            )
+
         kwargs = {"file_list": file_list}
         if audio_operations is not None:
             kwargs["audio_operations"] = audio_operations
@@ -1413,8 +1422,29 @@ class Engine:
         self.client.run(op)
         return op.response
 
+    def import_audio_to_clip_list_v5(
+        self,
+        file_list: List[str],
+        audio_operations: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> 'pt.ImportResponseBody':
+        """PTSL v5-compatible clip-list import via the generic Import command.
+
+        PT 2024.x does not support CId_ImportAudioToClipList. The equivalent
+        v5 path is CId_Import with MediaDestination=MD_ClipList.
+        """
+        del timeout
+        return _compat_v5.import_audio_to_clip_list(
+            self,
+            file_list=file_list,
+            audio_operations=audio_operations,
+        )
+
     def get_clip_list(self) -> List['pt.Clip']:
         """Get all clips in the current session's clip list."""
+        if self.client.get_server_version() < 6:
+            return _compat_v5.get_clip_list(self)
+
         op = ops.GetClipList(
             pagination_request=pt.PaginationRequest(limit=1000, offset=0)
         )
@@ -1435,6 +1465,16 @@ class Engine:
         :param color_index: Optional color index to assign to the clip instances.
             Uses the same palette as track colors (range [1, 69]).
         """
+        if self.client.get_server_version() < 6:
+            _compat_v5.spot_clips_by_id(
+                self,
+                clip_ids=clip_ids,
+                track_name=track_name,
+                location_value=location_value,
+                color_index=color_index,
+            )
+            return
+
         location_data = pt.SpotLocationData(
             location_type=pt.Start,
             location=pt.TimelineLocation(

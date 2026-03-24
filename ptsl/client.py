@@ -91,6 +91,7 @@ class Client:
     session_id: str
     auditor: Auditor
     is_open: bool
+    _server_version: Optional[int]
 
     def __init__(self,
                  company_name: Optional[str] = None,
@@ -111,6 +112,7 @@ class Client:
         self.raw_client = PTSL_pb2_grpc.PTSLStub(self.channel)
         self.session_id = ""
         self.auditor = Auditor(enabled=False)
+        self._server_version = None
 
         try:
             self._primitive_check_if_ready()
@@ -138,18 +140,22 @@ class Client:
             raise grpc_error
 
     def run_command(self, command_id: pt.CommandId,
-                    request: dict) -> Optional[dict]:
+                    request: dict,
+                    timeout: Optional[float] = 60.0) -> Optional[dict]:
         """
         Run a command on the client with a JSON request.
 
         :param command_id: The command to run
         :param request: The request parameters. This dict will be converted to
             JSON.
+        :param timeout: gRPC deadline in seconds. `None` disables the deadline.
         :returns: The response if any. This is the JSON response returned by
             the server and converted to a dict.
         """
         request_body_json = json.dumps(request)
-        response = self._send_sync_request(command_id, request_body_json)
+        response = self._send_sync_request(command_id,
+                                           request_body_json,
+                                           timeout=timeout)
 
         if response.header.status == pt.Failed:
             cleaned_response_error_json = response.response_error_json
@@ -164,6 +170,10 @@ class Client:
                 return json.loads(response.response_body_json)
             else:
                 return None
+        elif response.header.status in (pt.InProgress, pt.Pending, pt.Queued):
+            self._poll_until_complete(response.header.task_id,
+                                      max_wait=timeout or 60.0)
+            return None
         else:
             # FIXME: dump out for now, will be on the lookout for when
             # this happens
@@ -171,11 +181,31 @@ class Client:
                 f"Unexpected response code {response.header.status} " + \
                 f"({pt.TaskStatus.Name(response.header.status)})"
 
-    def run(self, op: Operation) -> None:
+    def run(self,
+            op: Operation,
+            timeout: Optional[float] = 60.0) -> None:
         """
         Run an operation on the client.
 
+        :param timeout: gRPC deadline in seconds. `None` disables the deadline.
         :raises: `CommandError` if the server returns an error
+        """
+        self._run_operation(op, timeout=timeout)
+
+    def run_with_timeout(self, op: Operation, timeout: Optional[float]) -> None:
+        """
+        Run an operation with a gRPC deadline.
+
+        :param timeout: Timeout in seconds passed to grpc. `None` means no
+            deadline.
+        """
+        self._run_operation(op, timeout=timeout)
+
+    def _run_operation(self, op: Operation,
+                       timeout: Optional[float] = None) -> None:
+        """
+        Shared implementation for running an operation, optionally with a gRPC
+        deadline.
         """
 
         self.auditor.run_called(op.command_id())
@@ -183,7 +213,8 @@ class Client:
         # convert the request body into JSON
         request_body_json = self._prepare_operation_request_json(op)
         response = self._send_sync_request(op.command_id(),
-                                           request_body_json)
+                                           request_body_json,
+                                           timeout=timeout)
         op.status = response.header.status
 
         if response.header.status == pt.Failed:
@@ -196,6 +227,9 @@ class Client:
 
         elif response.header.status == pt.Completed:
             self._handle_completed_response(op, response)
+        elif response.header.status in (pt.InProgress, pt.Pending, pt.Queued):
+            self._poll_until_complete(response.header.task_id,
+                                      max_wait=timeout or 60.0)
         else:
             # FIXME: dump out for now, will be on the lookout for when
             # this happens
@@ -221,9 +255,38 @@ class Client:
                     preserving_proto_field_name=True)
 
         self.auditor.request_json_before_cleanup(request_body_json)
-        request_body_json = operation.json_messup(request_body_json)
+        request_body_json = operation.json_messup_for_version(
+            request_body_json,
+            self.get_server_version(),
+        )
         self.auditor.request_json_after_cleanup(request_body_json)
         return request_body_json
+
+    def _poll_until_complete(self, task_id: str,
+                             max_wait: float = 60.0,
+                             poll_interval: float = 0.25) -> None:
+        """
+        Poll GetTaskStatus until the task reaches Completed or Failed.
+        """
+        deadline = time.time() + max_wait
+        while time.time() < deadline:
+            time.sleep(poll_interval)
+            response = self._send_sync_request(
+                pt.CId_GetTaskStatus,
+                json.dumps({"task_id": task_id}),
+            )
+
+            if response.header.status == pt.Completed:
+                return
+            if response.header.status == pt.Failed:
+                command_errors = json_format.Parse(
+                    response.response_error_json,
+                    pt.ResponseError(),
+                )
+                raise CommandError(list(command_errors.errors))
+
+        raise AssertionError(
+            f"Task {task_id!r} did not complete within {max_wait}s")
 
     def _response_error_json_cleanup(self, json_in: str) -> str:
         """
@@ -272,7 +335,8 @@ class Client:
             self.auditor.response_was_empty()
 
     def _send_sync_request(self, command_id,
-                           request_body_json, task_id="") -> pt.Response:
+                           request_body_json, task_id="",
+                           timeout: Optional[float] = 60.0) -> pt.Response:
         """
         Send a synchronous request to the server.
         """
@@ -285,7 +349,7 @@ class Client:
             ),
             request_body_json=request_body_json
         )
-        response = self.raw_client.SendGrpcRequest(request)
+        response = self.raw_client.SendGrpcRequest(request, timeout=timeout)
         return response
 
     def close(self):
@@ -295,6 +359,30 @@ class Client:
         self.is_open = False
         self.channel.close()
         self.session_id = ""
+        self._server_version = None
+
+    def get_server_version(self) -> int:
+        """
+        Return the connected Pro Tools server major version.
+
+        PT 2024.x reports 5; PT 2025.x reports 6 or a year-based value.
+        """
+        if self._server_version is None:
+            try:
+                response = self._send_sync_request(pt.CId_GetPTSLVersion, "")
+                if response.header.status == pt.Completed and response.response_body_json:
+                    parsed = json_format.Parse(
+                        response.response_body_json,
+                        pt.GetPTSLVersionResponseBody(),
+                        ignore_unknown_fields=True,
+                    )
+                    version = getattr(parsed, "version", 0) or 0
+                    self._server_version = int(version) if version else 5
+                else:
+                    self._server_version = 5
+            except Exception:
+                self._server_version = 5
+        return self._server_version
 
     def _primitive_check_if_ready(self) -> bool:
         """
