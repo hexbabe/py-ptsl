@@ -488,6 +488,13 @@ File Locations
 		:type: str
 	.. attribute:: info
 		:type: FileLocationInfo
+	.. attribute:: file_id
+		:type: str
+
+	.. note::
+
+		On Pro Tools 2024.10 / PTSL v5, live ``GetFileLocation`` responses include
+		``path`` and ``info.is_online`` but do not populate ``file_id``.
 
 
 .. class:: FileLocationInfo
@@ -1162,4 +1169,3 @@ Errors
         :value: 402
 
         Some PTSL functional is not implemented at the PT side
-

@@ -250,64 +250,9 @@ def _open_sibling_engine(engine):
         yield sibling_engine
 
 
-def _spot_stage_track_to_destination(
-    engine,
-    stage_track_name: str,
-    destination_track_name: str,
-    location_value: str,
-) -> None:
-    engine.select_tracks_by_name([stage_track_name])
-    engine.select_all_clips_on_track(stage_track_name)
-    engine.select_tracks_by_name([destination_track_name])
-    op = ops.CId_Spot(
-        track_offset_options=pt.Samples,
-        location_data=pt.SpotLocationData(
-            location_type=pt.Start,
-            location_options=pt.Samples,
-            location_value=str(location_value),
-        ),
-    )
-    engine.client.run(op, timeout=12.0)
-
-
-def _spot_stage_track_to_destination_fresh_engine(
-    engine,
-    stage_track_name: str,
-    destination_track_name: str,
-    location_value: str,
-) -> None:
-    with _open_sibling_engine(engine) as spot_engine:
-        _spot_stage_track_to_destination(
-            spot_engine,
-            stage_track_name=stage_track_name,
-            destination_track_name=destination_track_name,
-            location_value=location_value,
-        )
-
-
-def _clear_stage_track_contents(stage_engine, stage_track_name: str) -> None:
-    try:
-        stage_engine.set_track_hidden_state([stage_track_name], False)
-        stage_engine.select_tracks_by_name([stage_track_name])
-        stage_engine.select_all_clips_on_track(stage_track_name)
-        stage_engine.clear()
-    finally:
-        try:
-            stage_engine.set_track_hidden_state([stage_track_name], True)
-        except Exception:
-            pass
-
-
-def _clear_stage_track_contents_fresh_engine(
-    engine,
-    stage_track_name: str,
-) -> None:
-    try:
-        with _open_sibling_engine(engine) as cleanup_engine:
-            _clear_stage_track_contents(cleanup_engine, stage_track_name)
-    except Exception:
-        # Empty/undetected staging tracks should not fail the main spot path.
-        pass
+def _vacated_name(track_name: str) -> str:
+    """Internal name used for a pre-created empty track that was renamed aside."""
+    return f"_v5_empty_{track_name}"
 
 
 def spot_clips_by_id(
@@ -317,7 +262,16 @@ def spot_clips_by_id(
     location_value: str = "0",
     color_index: int | None = None,
 ) -> None:
-    """Emulate SpotClipsByID on PTSL v5 using the old Import command."""
+    """Emulate SpotClipsByID on PTSL v5 via Import + track rename.
+
+    PT 2024.x does not support SpotClipsByID (PTSL v6+). We emulate it by:
+      1. Renaming any pre-created empty destination track aside so its name is
+         free for the import to use.
+      2. Importing the audio file with ML_Spot, which causes PT to create a new
+         track named after the file with the clip placed at location_value.
+      3. Renaming that new stage track to the intended destination name.
+      4. Hiding the vacated empty track so it does not clutter the session.
+    """
     del color_index  # PT 2024.x has no clip-instance color API.
 
     _, registry = _session_registry(engine)
@@ -328,8 +282,20 @@ def spot_clips_by_id(
         if entry is None:
             raise KeyError(f"Unknown synthetic clip id: {clip_id}")
 
-        before_tracks = [track.name for track in engine.track_list()]
-        engine.select_tracks_by_name([track_name])
+        # Step 1: If a pre-created destination track exists, rename it aside so
+        # the import's stage track can later take the destination name.
+        current_names = {t.name for t in engine.track_list()}
+        vacated: str | None = None
+        if track_name in current_names:
+            vacated = _vacated_name(track_name)
+            engine.rename_target_track(track_name, vacated)
+            # Register as a stage track so filter_stage_tracks hides it from
+            # subsequent track_list() calls inside this loop.
+            _register_stage_track(registry, vacated)
+
+        # Step 2: Import file with ML_Spot. PT 2024.x creates a new track named
+        # after the file and places the clip at location_value.
+        before_names = {t.name for t in engine.track_list()}
         audio_data = pt.AudioData(
             file_list=[entry["file_path"]],
             audio_operations=pt.AddAudio,
@@ -343,20 +309,30 @@ def spot_clips_by_id(
         )
         op = ops.CId_Import(import_type=pt.Audio, audio_data=audio_data)
         engine.client.run(op, timeout=12.0)
-        after_tracks = [track.name for track in engine.track_list()]
-        extra_tracks = [
-            name for name in after_tracks
-            if name not in before_tracks and name != track_name
-        ]
-        for extra_track in extra_tracks:
-            entry["stage_track_name"] = extra_track
-            _cleanup_extra_track(engine, registry, extra_track)
-        stage_track_name = entry.get("stage_track_name") or entry["name"]
-        _spot_stage_track_to_destination_fresh_engine(
-            engine,
-            stage_track_name=stage_track_name,
-            destination_track_name=track_name,
-            location_value=str(location_value),
-        )
-        _clear_stage_track_contents_fresh_engine(engine, stage_track_name)
-        engine.select_tracks_by_name([track_name])
+
+        # Step 3: Rename the new stage track to the destination name.
+        after_names = [t.name for t in engine.track_list()]
+        new_tracks = [n for n in after_names if n not in before_names]
+        if new_tracks:
+            stage = new_tracks[0]
+            engine.rename_target_track(stage, track_name)
+        else:
+            # Import did not create a new track — restore the vacated track and
+            # raise so the caller can retry or report failure.
+            if vacated:
+                try:
+                    engine.rename_target_track(vacated, track_name)
+                    _register_stage_track(registry, vacated)  # keep hidden
+                except Exception:
+                    pass
+            raise RuntimeError(
+                f"v5 spot: import did not create a stage track for {track_name!r}"
+            )
+
+        # Step 4: Hide the vacated empty track so it does not appear in the
+        # session. It cannot be deleted on PTSL v5.
+        if vacated:
+            try:
+                engine.set_track_hidden_state([vacated], True)
+            except Exception:
+                pass

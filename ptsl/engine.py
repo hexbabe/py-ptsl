@@ -516,6 +516,11 @@ class Engine:
             If none, defaults
             to [:attr:`~ptsl.PTSL_pb2.FileLocationTypeFilter.All_Files`]
         :returns: a List of :py:class:`~ptsl.PTSL_pb2.FileLocation`
+
+        Note:
+            On Pro Tools 2024.10 / PTSL v5, the server returns ``path`` and
+            ``info.is_online`` for each entry but does not populate
+            ``FileLocation.file_id``.
         """
         if filters is None:
             filters = [pt.All_Files]
