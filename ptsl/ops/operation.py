@@ -52,6 +52,7 @@ class Operation(Generic[Q, R]):
         self.response = None  # type: ignore
         self.status = None
         self.task_id = ""
+        self.completed_errors = []
 
     def json_messup(self, in_json: str) -> str:
         """
@@ -90,6 +91,13 @@ class Operation(Generic[Q, R]):
         `json_format.Parse` method.
         """
         return in_json
+
+    def raise_completed_warnings(self) -> bool:
+        """
+        Whether warning payloads attached to a Completed response should be
+        surfaced as CommandError exceptions.
+        """
+        return False
 
     def on_empty_response_body(self):
         """

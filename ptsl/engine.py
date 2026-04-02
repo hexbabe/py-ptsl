@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Optional, Tuple, List
 
 from contextlib import contextmanager
+import os
 
 import ptsl
 from ptsl import _compat_v5
@@ -50,6 +51,15 @@ def open_engine(*args, **kwargs):
         yield engine
     finally:
         engine.close()
+
+
+def _normalize_session_path(path: str) -> str:
+    path = os.path.abspath(path)
+    if path == "/private/tmp":
+        return "/tmp"
+    if path.startswith("/private/tmp/"):
+        return "/tmp/" + path[len("/private/tmp/"):]
+    return path
 
 
 class Engine:
@@ -182,6 +192,18 @@ class Engine:
         """
         Open a session.
         """
+        try:
+            current_path = self.session_path()
+        except Exception:
+            current_path = None
+
+        if (
+            isinstance(current_path, str)
+            and current_path
+            and _normalize_session_path(current_path) == _normalize_session_path(path)
+        ):
+            return
+
         op = ops.CId_OpenSession(session_path=path)
         self.client.run(op)
 
@@ -702,6 +724,9 @@ class Engine:
 
         self.client.run(op)
 
+        if self.client.get_server_version() < 6:
+            return _compat_v5.filter_stage_tracks(self, op.track_list)
+
         return op.track_list
 
     def set_playback_mode(self, new_mode: 'PlaybackMode'):
@@ -889,6 +914,11 @@ class Engine:
 
     def delete_tracks(self, track_names: List[str]):
         """Delete tracks by name."""
+        if self.client.get_server_version() < 6:
+            raise RuntimeError(
+                "delete_tracks requires Pro Tools 2025.10+ / PTSL v6. "
+                "PT 2024.x does not expose a working DeleteTracks gRPC command."
+            )
         op = ops.DeleteTracks(track_names=track_names)
         self.client.run(op)
 

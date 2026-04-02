@@ -20,6 +20,7 @@ from ptsl.ops import Operation
 
 
 PTSL_VERSION = 5
+_QUEUED_TASK_STATUSES = (pt.InProgress, pt.Pending, pt.Queued)
 
 
 @contextmanager
@@ -108,6 +109,11 @@ class Client:
             2023.3).
         """
 
+        self.company_name = company_name
+        self.application_name = application_name
+        self.certificate_path = certificate_path
+        self.address = address
+
         self.channel = grpc.insecure_channel(address)
         self.raw_client = PTSL_pb2_grpc.PTSLStub(self.channel)
         self.session_id = ""
@@ -156,24 +162,26 @@ class Client:
         response = self._send_sync_request(command_id,
                                            request_body_json,
                                            timeout=timeout)
+        response = self._resolve_terminal_response(
+            command_id,
+            request_body_json,
+            response,
+            timeout=timeout,
+        )
 
         if response.header.status == pt.Failed:
-            cleaned_response_error_json = response.response_error_json
-            # self._response_error_json_cleanup(
-            # response.response_error_json)
-            command_errors = json_format.Parse(cleaned_response_error_json,
-                                               pt.ResponseError())
-            raise CommandError(list(command_errors.errors))
+            raise CommandError(
+                self._parse_response_errors(response.response_error_json))
 
         elif response.header.status == pt.Completed:
+            completed_errors = self._parse_response_errors(
+                response.response_error_json)
+            if completed_errors:
+                raise CommandError(completed_errors)
             if len(response.response_body_json) > 0:
                 return json.loads(response.response_body_json)
             else:
                 return None
-        elif response.header.status in (pt.InProgress, pt.Pending, pt.Queued):
-            self._poll_until_complete(response.header.task_id,
-                                      max_wait=timeout or 60.0)
-            return None
         else:
             # FIXME: dump out for now, will be on the lookout for when
             # this happens
@@ -215,21 +223,27 @@ class Client:
         response = self._send_sync_request(op.command_id(),
                                            request_body_json,
                                            timeout=timeout)
+        response = self._resolve_terminal_response(
+            op.command_id(),
+            request_body_json,
+            response,
+            timeout=timeout,
+        )
         op.status = response.header.status
 
         if response.header.status == pt.Failed:
-            cleaned_response_error_json = response.response_error_json
-            # self._response_error_json_cleanup(
-            # response.response_error_json)
-            command_errors = json_format.Parse(cleaned_response_error_json,
-                                               pt.ResponseError())
-            raise CommandError(list(command_errors.errors))
+            raise CommandError(
+                self._parse_response_errors(response.response_error_json))
 
         elif response.header.status == pt.Completed:
+            completed_errors = self._parse_response_errors(
+                response.response_error_json)
+            op.completed_errors = completed_errors
+            if completed_errors and (
+                    any(not err.is_warning for err in completed_errors)
+                    or op.raise_completed_warnings()):
+                raise CommandError(completed_errors)
             self._handle_completed_response(op, response)
-        elif response.header.status in (pt.InProgress, pt.Pending, pt.Queued):
-            self._poll_until_complete(response.header.task_id,
-                                      max_wait=timeout or 60.0)
         else:
             # FIXME: dump out for now, will be on the lookout for when
             # this happens
@@ -262,31 +276,80 @@ class Client:
         self.auditor.request_json_after_cleanup(request_body_json)
         return request_body_json
 
+    def _parse_response_errors(self, response_error_json: str):
+        if not response_error_json or not response_error_json.strip():
+            return []
+
+        cleaned_response_error_json = response_error_json
+        command_errors = json_format.Parse(cleaned_response_error_json,
+                                           pt.ResponseError())
+        return list(command_errors.errors)
+
+    def _resolve_terminal_response(self,
+                                   command_id: pt.CommandId,
+                                   request_body_json: str,
+                                   response: pt.Response,
+                                   timeout: Optional[float]) -> pt.Response:
+        while response.header.status in _QUEUED_TASK_STATUSES:
+            task_id = response.header.task_id
+            assert task_id, (
+                f"{pt.CommandId.Name(command_id)} returned "
+                f"{pt.TaskStatus.Name(response.header.status)} without task_id"
+            )
+            self._poll_until_complete(task_id, max_wait=timeout)
+            response = self._send_sync_request(
+                command_id,
+                request_body_json,
+                task_id=task_id,
+                timeout=timeout,
+            )
+
+        return response
+
+    def _parse_task_status(self, response_body_json: str) -> pt.TaskStatus:
+        assert response_body_json, "GetTaskStatus returned an empty response body"
+        body = json_format.Parse(
+            response_body_json,
+            pt.GetTaskStatusResponseBody(),
+            ignore_unknown_fields=True,
+        )
+        return body.status
+
     def _poll_until_complete(self, task_id: str,
-                             max_wait: float = 60.0,
-                             poll_interval: float = 0.25) -> None:
+                             max_wait: Optional[float] = 60.0,
+                             poll_interval: float = 0.25) -> pt.TaskStatus:
         """
         Poll GetTaskStatus until the task reaches Completed or Failed.
         """
-        deadline = time.time() + max_wait
-        while time.time() < deadline:
+        deadline = None if max_wait is None else time.time() + max_wait
+        while deadline is None or time.time() < deadline:
             time.sleep(poll_interval)
+            remaining = None if deadline is None else max(deadline - time.time(), 0.0)
             response = self._send_sync_request(
                 pt.CId_GetTaskStatus,
                 json.dumps({"task_id": task_id}),
+                timeout=remaining,
             )
 
-            if response.header.status == pt.Completed:
-                return
             if response.header.status == pt.Failed:
-                command_errors = json_format.Parse(
-                    response.response_error_json,
-                    pt.ResponseError(),
+                raise CommandError(
+                    self._parse_response_errors(response.response_error_json))
+            if response.header.status in _QUEUED_TASK_STATUSES:
+                continue
+            if response.header.status != pt.Completed:
+                assert False, (
+                    f"Unexpected GetTaskStatus response code "
+                    f"{response.header.status} "
+                    f"({pt.TaskStatus.Name(response.header.status)})"
                 )
-                raise CommandError(list(command_errors.errors))
+
+            task_status = self._parse_task_status(response.response_body_json)
+            if task_status in (pt.Completed, pt.Failed):
+                return task_status
 
         raise AssertionError(
-            f"Task {task_id!r} did not complete within {max_wait}s")
+            f"Task {task_id!r} did not complete within "
+            f"{'the allotted time' if max_wait is None else f'{max_wait}s'}")
 
     def _response_error_json_cleanup(self, json_in: str) -> str:
         """

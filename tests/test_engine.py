@@ -13,6 +13,7 @@ def open_engine_with_mock_client(expected_response=Optional[Any]):
     with patch('ptsl.Client'):
         with open_engine(company_name="none",
                          application_name="none") as engine:
+            engine.client.get_server_version.return_value = 6
             if expected_response is None:
                 yield engine
                 engine.client.run.assert_called()
@@ -115,6 +116,24 @@ class TestEngine(TestCase):
                     path="path/to/session"
                 )
             )
+
+    def test_open_session_noops_when_target_already_open(self):
+        with patch('ptsl.Client'):
+            with open_engine(company_name="none",
+                             application_name="none") as engine:
+                engine.client.get_server_version.return_value = 6
+                engine.session_path = Mock(
+                    return_value="/private/tmp/path/to/session.ptx"
+                )
+                engine.client.run.reset_mock()
+
+                self.assertIsNone(
+                    engine.open_session(
+                        path="/tmp/path/to/session.ptx"
+                    )
+                )
+
+                engine.client.run.assert_not_called()
 
     def test_close_session(self):
         with open_engine_with_mock_client() as engine:
@@ -510,6 +529,26 @@ class TestEngine(TestCase):
             self.assertEqual(got[0].name, "Track 1")
             self.assertEqual(got[0].track_attributes.contains_clips, False)
 
+    def test_track_list_filters_v5_stage_tracks(self):
+        fixture = pt.GetTrackListResponseBody(
+            stats=None,
+            track_list=[
+                pt.Track(name="Visible", type=pt.AudioTrack, id="v", index=0),
+                pt.Track(name="HiddenStage", type=pt.AudioTrack, id="s", index=1),
+            ],
+        )
+
+        with open_engine_with_mock_client(fixture) as engine:
+            engine.client.get_server_version.return_value = 5
+            with patch(
+                "ptsl.engine._compat_v5.filter_stage_tracks",
+                return_value=[fixture.track_list[0]],
+            ) as filter_mock:
+                got = engine.track_list()
+
+        filter_mock.assert_called_once()
+        self.assertEqual([track.name for track in got], ["Visible"])
+
     def test_set_playback_mode(self):
         with open_engine_with_mock_client() as engine:
             self.assertIsNone(engine.set_playback_mode(
@@ -534,6 +573,19 @@ class TestEngine(TestCase):
             self.assertIsNone(
                 engine.set_session_audio_format(new_audio_format=pt.SAF_AIFF)
             )
+
+    def test_delete_tracks_raises_on_v5(self):
+        with patch('ptsl.Client'):
+            with open_engine(company_name="none",
+                             application_name="none") as engine:
+                engine.client.get_server_version.return_value = 5
+
+                with self.assertRaisesRegex(
+                        RuntimeError,
+                        r"delete_tracks requires Pro Tools 2025\.10\+ / PTSL v6"):
+                    engine.delete_tracks(["Track 1"])
+
+                engine.client.run.assert_not_called()
 
     def test_set_session_start_time(self):
         with open_engine_with_mock_client() as engine:

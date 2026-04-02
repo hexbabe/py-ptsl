@@ -25,6 +25,10 @@ $ source venv/bin/activate
 $ python3 -m pip install -e .
 ```
 
+PT 2024.x clip-list import compatibility now relies on `soundfile` and
+`librosa`. Those packages are installed as part of the standard `py-ptsl`
+runtime dependencies.
+
 If you'd like to build the documentation, install the `doc` optional 
 dependencies.
 

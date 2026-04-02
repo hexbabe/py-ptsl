@@ -7,15 +7,17 @@ even though PT 2024.x does not support GetClipList / SpotClipsByID.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import os
 import shutil
+from typing import Iterable
 
 import ptsl.PTSL_pb2 as pt
 from ptsl import ops
 
 
-_REGISTRY: dict[str, dict[str, dict[str, dict[str, str]]]] = {}
+_REGISTRY: dict[str, dict[str, object]] = {}
 
 
 def _normalize_tmp_path(path: str) -> str:
@@ -39,11 +41,11 @@ def _session_key(engine) -> str:
     return session_path
 
 
-def _session_registry(engine) -> tuple[str, dict[str, dict[str, dict[str, str]]]]:
+def _session_registry(engine) -> tuple[str, dict[str, object]]:
     session_key = _session_key(engine)
     registry = _REGISTRY.get(session_key)
     if registry is None:
-        registry = {"by_id": {}, "by_root": {}}
+        registry = {"by_id": {}, "by_source": {}, "stage_tracks": set()}
         _REGISTRY[session_key] = registry
     return session_key, registry
 
@@ -52,9 +54,13 @@ def _lookup_root(path: str) -> str:
     return os.path.splitext(os.path.basename(path))[0].lower()
 
 
-def _stable_ids(session_key: str, lookup_root: str) -> tuple[str, str]:
+def _source_key(path: str) -> str:
+    return _normalize_tmp_path(os.path.abspath(path))
+
+
+def _stable_ids(session_key: str, source_key: str) -> tuple[str, str]:
     digest = hashlib.sha1(
-        f"{session_key}\0{lookup_root}".encode("utf-8")
+        f"{session_key}\0{source_key}".encode("utf-8")
     ).hexdigest()[:16]
     return (f"v5clip_{digest}", f"v5file_{digest}")
 
@@ -68,7 +74,7 @@ def _copy_and_maybe_resample(
     file_list: list[str],
     session_audio_dir: str,
     session_sr: int,
-) -> list[str]:
+) -> dict[str, str]:
     """Prepare files for PT 2024.x spotting.
 
     PT 2024.x behaves most reliably when the source file already lives in the
@@ -82,11 +88,17 @@ def _copy_and_maybe_resample(
         _librosa = None
 
     os.makedirs(session_audio_dir, exist_ok=True)
-    prepared: list[str] = []
+    prepared: dict[str, str] = {}
 
     for src in file_list:
+        source_key = _source_key(src)
         safe_name = os.path.basename(src).replace(" ", "_")
-        dst = os.path.join(session_audio_dir, safe_name)
+        source_dir = os.path.join(
+            session_audio_dir,
+            hashlib.sha1(source_key.encode("utf-8")).hexdigest()[:12],
+        )
+        os.makedirs(source_dir, exist_ok=True)
+        dst = os.path.join(source_dir, safe_name)
         dst = _normalize_tmp_path(dst)
         src_abs = os.path.abspath(src)
         dst_abs = os.path.abspath(dst)
@@ -110,7 +122,7 @@ def _copy_and_maybe_resample(
         elif not already_there:
             shutil.copy2(src, dst)
 
-        prepared.append(dst)
+        prepared[source_key] = dst
 
     return prepared
 
@@ -129,6 +141,8 @@ def import_audio_to_clip_list(
     del audio_operations  # v5 shim always prepares AddAudio-compatible files.
 
     session_key, registry = _session_registry(engine)
+    by_id = registry["by_id"]
+    by_source = registry["by_source"]
     session_sr = engine.session_sample_rate()
     if not isinstance(session_sr, int):
         session_sr = 0
@@ -138,36 +152,33 @@ def import_audio_to_clip_list(
 
     response = pt.ImportAudioToClipListResponseBody()
     to_prepare: list[str] = []
-    prepared_meta: list[tuple[str, str]] = []
 
     for path in file_list:
-        lookup_root = _lookup_root(path)
-        existing = registry["by_root"].get(lookup_root)
+        source_key = _source_key(path)
+        existing = by_source.get(source_key)
         if existing is None:
             to_prepare.append(path)
-            prepared_meta.append((path, lookup_root))
 
     prepared_paths = _copy_and_maybe_resample(to_prepare, target_dir, session_sr)
-    prepared_iter = iter(prepared_paths)
 
     for original_path in file_list:
-        lookup_root = _lookup_root(original_path)
-        entry = registry["by_root"].get(lookup_root)
+        source_key = _source_key(original_path)
+        entry = by_source.get(source_key)
         if entry is None:
-            prepared_path = next(prepared_iter)
-            clip_name = os.path.splitext(os.path.basename(prepared_path))[0]
-            clip_id, file_id = _stable_ids(session_key, lookup_root)
+            prepared_path = prepared_paths[source_key]
+            clip_name = os.path.splitext(os.path.basename(original_path))[0]
+            clip_id, file_id = _stable_ids(session_key, source_key)
             entry = {
                 "name": clip_name,
                 "root": clip_name,
-                "lookup_root": lookup_root,
+                "lookup_root": _lookup_root(original_path),
+                "source_key": source_key,
                 "clip_id": clip_id,
                 "file_id": file_id,
                 "file_path": prepared_path,
             }
-            registry["by_id"][clip_id] = entry
-            registry["by_root"][lookup_root] = entry
-            registry["by_root"].setdefault(clip_name.lower(), entry)
+            by_id[clip_id] = entry
+            by_source[source_key] = entry
 
         response_entry = response.file_list.add()
         response_entry.original_input_path = original_path
@@ -182,8 +193,9 @@ def import_audio_to_clip_list(
 def get_clip_list(engine) -> list[pt.Clip]:
     """Return synthetic Clip messages for the v5 registry."""
     _, registry = _session_registry(engine)
+    by_id = registry["by_id"]
     clips: list[pt.Clip] = []
-    for entry in registry["by_id"].values():
+    for entry in by_id.values():
         clips.append(pt.Clip(
             file_id=entry["file_id"],
             clip_id=entry["clip_id"],
@@ -194,16 +206,107 @@ def get_clip_list(engine) -> list[pt.Clip]:
     return clips
 
 
-def _cleanup_extra_track(engine, track_name: str) -> None:
-    try:
-        engine.select_all_clips_on_track(track_name)
-        engine.clear()
-    except Exception:
-        pass
+def _register_stage_track(registry: dict[str, object], track_name: str) -> None:
+    stage_tracks = registry.get("stage_tracks")
+    if not isinstance(stage_tracks, set):
+        stage_tracks = set()
+        registry["stage_tracks"] = stage_tracks
+    stage_tracks.add(track_name)
 
+
+def filter_stage_tracks(engine, tracks: Iterable[pt.Track]) -> list[pt.Track]:
+    """Hide shim-created staging tracks from the public v5 track list."""
+    _, registry = _session_registry(engine)
+    stage_tracks = registry.get("stage_tracks")
+    if not isinstance(stage_tracks, set) or not stage_tracks:
+        return list(tracks)
+
+    return [track for track in tracks if track.name not in stage_tracks]
+
+
+def _cleanup_extra_track(engine, registry: dict[str, object], track_name: str) -> None:
+    _register_stage_track(registry, track_name)
     try:
         engine.set_track_hidden_state([track_name], True)
     except Exception:
+        pass
+
+
+@contextmanager
+def _open_sibling_engine(engine):
+    from ptsl import open_engine as _open_engine
+
+    client = engine.client
+    kwargs = {"address": getattr(client, "address", "localhost:31416")}
+    certificate_path = getattr(client, "certificate_path", None)
+    if certificate_path is not None:
+        kwargs["certificate_path"] = certificate_path
+    else:
+        kwargs["company_name"] = getattr(client, "company_name", "py-ptsl")
+        kwargs["application_name"] = getattr(
+            client, "application_name", "py-ptsl")
+
+    with _open_engine(**kwargs) as sibling_engine:
+        yield sibling_engine
+
+
+def _spot_stage_track_to_destination(
+    engine,
+    stage_track_name: str,
+    destination_track_name: str,
+    location_value: str,
+) -> None:
+    engine.select_tracks_by_name([stage_track_name])
+    engine.select_all_clips_on_track(stage_track_name)
+    engine.select_tracks_by_name([destination_track_name])
+    op = ops.CId_Spot(
+        track_offset_options=pt.Samples,
+        location_data=pt.SpotLocationData(
+            location_type=pt.Start,
+            location_options=pt.Samples,
+            location_value=str(location_value),
+        ),
+    )
+    engine.client.run(op, timeout=12.0)
+
+
+def _spot_stage_track_to_destination_fresh_engine(
+    engine,
+    stage_track_name: str,
+    destination_track_name: str,
+    location_value: str,
+) -> None:
+    with _open_sibling_engine(engine) as spot_engine:
+        _spot_stage_track_to_destination(
+            spot_engine,
+            stage_track_name=stage_track_name,
+            destination_track_name=destination_track_name,
+            location_value=location_value,
+        )
+
+
+def _clear_stage_track_contents(stage_engine, stage_track_name: str) -> None:
+    try:
+        stage_engine.set_track_hidden_state([stage_track_name], False)
+        stage_engine.select_tracks_by_name([stage_track_name])
+        stage_engine.select_all_clips_on_track(stage_track_name)
+        stage_engine.clear()
+    finally:
+        try:
+            stage_engine.set_track_hidden_state([stage_track_name], True)
+        except Exception:
+            pass
+
+
+def _clear_stage_track_contents_fresh_engine(
+    engine,
+    stage_track_name: str,
+) -> None:
+    try:
+        with _open_sibling_engine(engine) as cleanup_engine:
+            _clear_stage_track_contents(cleanup_engine, stage_track_name)
+    except Exception:
+        # Empty/undetected staging tracks should not fail the main spot path.
         pass
 
 
@@ -218,9 +321,10 @@ def spot_clips_by_id(
     del color_index  # PT 2024.x has no clip-instance color API.
 
     _, registry = _session_registry(engine)
+    by_id = registry["by_id"]
 
     for clip_id in clip_ids:
-        entry = registry["by_id"].get(clip_id)
+        entry = by_id.get(clip_id)
         if entry is None:
             raise KeyError(f"Unknown synthetic clip id: {clip_id}")
 
@@ -245,4 +349,14 @@ def spot_clips_by_id(
             if name not in before_tracks and name != track_name
         ]
         for extra_track in extra_tracks:
-            _cleanup_extra_track(engine, extra_track)
+            entry["stage_track_name"] = extra_track
+            _cleanup_extra_track(engine, registry, extra_track)
+        stage_track_name = entry.get("stage_track_name") or entry["name"]
+        _spot_stage_track_to_destination_fresh_engine(
+            engine,
+            stage_track_name=stage_track_name,
+            destination_track_name=track_name,
+            location_value=str(location_value),
+        )
+        _clear_stage_track_contents_fresh_engine(engine, stage_track_name)
+        engine.select_tracks_by_name([track_name])
